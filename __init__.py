@@ -1,1 +1,1 @@
-"""Elgiva Theatre scraper package."""
+"""Elgiva scraper package."""
