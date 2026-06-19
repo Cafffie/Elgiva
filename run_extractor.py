@@ -13,6 +13,7 @@ Navigation hierarchy:
 import json
 import re
 import time
+from datetime import datetime
 
 import pandas as pd
 from selenium.common.exceptions import TimeoutException, WebDriverException
@@ -41,7 +42,6 @@ from .elgiva_config import (
     DELAY_BETWEEN_PERFS,
     DELAY_BETWEEN_SHOWS,
     HEADLESS,
-    IFRAME_WAIT_TIMEOUT,
     PAGE_LOAD_TIMEOUT,
     PAGES,
     SEAT_WAIT_TIMEOUT,
@@ -63,8 +63,10 @@ class ElgivaExtractor(BaseExtractor):
 
     def extract(self) -> bytes:
         all_data = []
-        venue_details = {"venue": None, "address": None, "city": None, "country": None}
-        driver = self.launch_driver(headless=HEADLESS, page_load_timeout=PAGE_LOAD_TIMEOUT)
+        venue_details = {"address": None, "city": None, "country": None}
+        driver = self.launch_driver(
+            headless=HEADLESS, page_load_timeout=PAGE_LOAD_TIMEOUT
+        )
 
         try:
             all_shows = []
@@ -76,7 +78,7 @@ class ElgivaExtractor(BaseExtractor):
                 if i == 0:
                     venue_details = self._get_venue_details(driver)
                     self.custom_logger.info(
-                        f"  Venue: {venue_details['venue']} | {venue_details['address']} | "
+                        f" {venue_details['address']} | "
                         f"{venue_details['city']}, {venue_details['country']}"
                     )
                 shows = self._extract_event_list(driver, category)
@@ -96,6 +98,17 @@ class ElgivaExtractor(BaseExtractor):
                         f"  Skipping duplicate: {show['title']!r} (already queued)"
                     )
             all_shows = deduped
+
+            # Remove NT Live shows
+            filtered_shows = [
+                show for show in all_shows if "nt live" not in show["title"].lower()
+            ]
+
+            skipped = len(all_shows) - len(filtered_shows)
+            if skipped:
+                self.custom_logger.info(f"Skipped {skipped} NT Live show(s)")
+
+            all_shows = filtered_shows
 
             if self.show_count:
                 all_shows = all_shows[: self.show_count]
@@ -132,7 +145,9 @@ class ElgivaExtractor(BaseExtractor):
         if not df.empty and "is_limited_run" in df.columns:
             df["is_limited_run"] = None
         if not df.empty and "capacity" in df.columns:
-            df["capacity"] = pd.to_numeric(df["capacity"], errors="coerce").astype("Int64")
+            df["capacity"] = pd.to_numeric(df["capacity"], errors="coerce").astype(
+                "Int64"
+            )
         return df
 
     def _parse(self, raw: bytes) -> pd.DataFrame:
@@ -196,7 +211,7 @@ class ElgivaExtractor(BaseExtractor):
         accept_cookies(driver, xpath=COOKIE_BTN_XPATH)
         self._scroll_to_load_all(driver)
 
-        performances = self._extract_performances(driver)
+        performances, venue = self._extract_performances(driver)
 
         if not performances:
             self.custom_logger.warning(
@@ -208,15 +223,19 @@ class ElgivaExtractor(BaseExtractor):
             driver, performances
         )
 
-        dates = [p["date"] for p in performances]
-        open_date = min(dates)
-        close_date = max(dates)
+        if performances:
+            sorted_dates = sorted([p["date"] for p in performances])
+            open_date = sorted_dates[0]
+            close_date = sorted_dates[-1]
+        else:
+            open_date = datetime.now().strftime("%Y-%m-%d")
+            close_date = datetime.now().strftime("%Y-%m-%d")
 
         return {
             "title": show["title"],
             "venue_url": show["event_url"],
             "category": standardize_category(show["category"]),
-            "venue": venue_details["venue"],
+            "venue": venue,
             "address": venue_details["address"],
             "city": venue_details["city"],
             "country": normalize_country(venue_details["country"]),
@@ -238,12 +257,19 @@ class ElgivaExtractor(BaseExtractor):
     # Level 3 — Performance calendar
     # ------------------------------------------------------------------
 
-    def _extract_performances(self, driver) -> list[dict]:
+    def _extract_performances(self, driver) -> tuple[list[dict], str | None]:
+        venue = None
         performances = []
+
         try:
-            rows = driver.find_elements(
-                By.CSS_SELECTOR, "tr[class*='dot_events_day_']"
-            )
+            venue = driver.find_element(
+                By.CSS_SELECTOR, ".elementor-widget-container span.venue-name"
+            ).text.strip()
+        except Exception as e:
+            self.custom_logger.warning(f"  Error extracting venue: {e}")
+
+        try:
+            rows = driver.find_elements(By.CSS_SELECTOR, "tr[class*='dot_events_day_']")
             for row in rows:
                 class_attr = row.get_attribute("class") or ""
                 date_match = re.search(
@@ -273,18 +299,18 @@ class ElgivaExtractor(BaseExtractor):
                                 "date": iso_date,
                                 "time": iso_time,
                                 "booking_url": (
-                                    "" if is_sold_out else (link.get_attribute("href") or "")
+                                    ""
+                                    if is_sold_out
+                                    else (link.get_attribute("href") or "")
                                 ),
                                 "sold_out": is_sold_out,
                             }
                         )
                     except Exception as inner_e:
-                        self.custom_logger.warning(
-                            f"  Skipping perf entry: {inner_e}"
-                        )
+                        self.custom_logger.warning(f"  Skipping perf entry: {inner_e}")
         except Exception as e:
             self.custom_logger.warning(f"  Error extracting performances: {e}")
-        return performances
+        return performances, venue
 
     def _parse_link_time(self, link_element) -> str | None:
         """Extract and normalise performance time from a calendar link element."""
@@ -296,7 +322,9 @@ class ElgivaExtractor(BaseExtractor):
                 return None
             hour, minute = match.group(1), match.group(2)
             suffix = "pm" if "pm" in raw_text else "am" if "am" in raw_text else ""
-            time_str = f"{hour}:{minute} {suffix}".strip() if suffix else f"{hour}:{minute}"
+            time_str = (
+                f"{hour}:{minute} {suffix}".strip() if suffix else f"{hour}:{minute}"
+            )
             return convert_to_24hr(time_str)
         except Exception:
             return None
@@ -312,11 +340,15 @@ class ElgivaExtractor(BaseExtractor):
         currency = None
         max_capacity = None
 
+        # NEW FLAG: Tracks if we hit a technical "no seat map available" or layout error
+        encountered_no_seatmap = False
+
         for i, perf in enumerate(performances, 1):
             key = format_datetime_key(perf["date"], perf["time"])
             if not key:
                 continue
 
+            # If there's no booking URL (e.g. sold out), we can't get seat pricing, but we can still record the performance with an empty seat list
             if not perf.get("booking_url"):
                 seat_pricing[key] = []
                 continue
@@ -328,52 +360,73 @@ class ElgivaExtractor(BaseExtractor):
             try:
                 driver.get(perf["booking_url"])
 
-                iframe = WebDriverWait(driver, IFRAME_WAIT_TIMEOUT).until(
-                    EC.presence_of_element_located((By.ID, "SpektrixIFrame"))
-                )
-                driver.switch_to.frame(iframe)
+                iframes = driver.find_elements(By.ID, "SpektrixIFrame")
 
-                WebDriverWait(driver, SEAT_WAIT_TIMEOUT).until(
-                    EC.presence_of_element_located(
-                        (By.CSS_SELECTOR, "div.SeatingArea img")
-                    )
-                )
+                if iframes:
+                    iframe = iframes[0]
 
-                seat_images = driver.find_elements(
-                    By.CSS_SELECTOR, "div.SeatingArea img"
-                )
-                perf_capacity = len(seat_images)
-                if max_capacity is None or perf_capacity > max_capacity:
-                    max_capacity = perf_capacity
+                    driver.switch_to.frame(iframe)
 
-                seat_list = []
-                for img in seat_images:
-                    tooltip = (
-                        img.get_attribute("tooltip") or img.get_attribute("title") or ""
-                    )
-                    if not tooltip:
-                        continue
-
-                    match = re.search(r"([A-Z]+\d+)\s*-\s*[££]?([\d,.]+)", tooltip)
-                    if not match:
-                        continue
-
-                    if currency is None:
-                        currency = get_currency_from_price(tooltip)
-
-                    seat_list.append(
-                        {
-                            "seat": match.group(1),
-                            "ticket_price": float(match.group(2).replace(",", "")),
-                        }
+                    WebDriverWait(driver, SEAT_WAIT_TIMEOUT).until(
+                        EC.presence_of_element_located(
+                            (By.CSS_SELECTOR, "div.SeatingArea img")
+                        )
                     )
 
-                seat_pricing[key] = seat_list
-                self.custom_logger.info(f"    {len(seat_list)} seats extracted")
+                    seat_images = driver.find_elements(
+                        By.CSS_SELECTOR, "div.SeatingArea img"
+                    )
+                    self.custom_logger.info(f" Found {len(seat_images)} unique seats. ")
 
-            except Exception as e:
-                self.custom_logger.warning(f"  Seat extraction error: {e}")
+                    perf_capacity = len(seat_images)
+                    if max_capacity is None or perf_capacity > max_capacity:
+                        max_capacity = perf_capacity
+
+                    seat_list = []
+                    for img in seat_images:
+                        tooltip = (
+                            img.get_attribute("tooltip")
+                            or img.get_attribute("title")
+                            or ""
+                        )
+                        if not tooltip:
+                            continue
+
+                        match = re.search(r"([A-Z]+\d+)\s*-\s*[££]?([\d,.]+)", tooltip)
+                        if not match:
+                            continue
+
+                        if currency is None:
+                            currency = get_currency_from_price(tooltip)
+
+                        seat_list.append(
+                            {
+                                "seat": match.group(1),
+                                "ticket_price": float(match.group(2).replace(",", "")),
+                            }
+                        )
+
+                    if seat_list:
+                        seat_pricing[key] = seat_list
+
+                    self.custom_logger.info(f"    {len(seat_list)} seats extracted")
+
+                else:
+                    # MISSING SEATMAP: Page loaded but iframe layout isn't there
+                    seat_pricing[key] = []
+                    encountered_no_seatmap = True  # <--- Flagged
+                    self.custom_logger.info(
+                        f" Non seat map available for {perf['date']} {perf['time']}"
+                    )
+
+            except Exception:
+                # LAYOUT ERROR / TIMEOUT
                 seat_pricing[key] = []
+                encountered_no_seatmap = True  # <--- Flagged
+                self.custom_logger.warning(
+                    f" No seat map / unsupported layout for {perf['date']} {perf['time']}"
+                )
+                continue
 
             finally:
                 try:
@@ -382,6 +435,19 @@ class ElgivaExtractor(BaseExtractor):
                     pass
 
             human_delay(*DELAY_BETWEEN_PERFS)
+
+        # =================================================================================
+        # CONDITIONAL CHECK:
+        # Only clear to {} if we actually hit "no seatmap" issues AND everything is empty.
+        # =================================================================================
+        if encountered_no_seatmap and all(
+            len(seats) == 0 for seats in seat_pricing.values()
+        ):
+            self.custom_logger.info(
+                " All performances lack a seat map layout. Resetting seat_pricing = {}"
+            )
+            seat_pricing = {}
+        # =================================================================================
 
         return seat_pricing, currency, max_capacity
 
@@ -404,7 +470,7 @@ class ElgivaExtractor(BaseExtractor):
         for p in perfs:
             key = f"{p['date']} {p['time']}"
             seats = seat_pricing.get(key, [])
-            seat_label = f"{len(seats)} seats" if seats else "sold out / no data"
+            seat_label = f"{len(seats)} seats" if seats else "No seat map available"
             lines.append(f"       • {key}  →  {seat_label}")
         lines.append(divider)
         self.custom_logger.info("\n".join(lines))
@@ -430,7 +496,7 @@ class ElgivaExtractor(BaseExtractor):
             © The Elgiva 2026. All rights reserved.
             St Mary's Way, Chesham, Buckinghamshire, HP5 1HR
         """
-        result = {"venue": None, "address": None, "city": None, "country": None}
+        result = {"address": None, "city": None, "country": None}
         try:
             for el in driver.find_elements(By.XPATH, "//p[contains(., 'HP5')]"):
                 # Normalise non-breaking spaces and curly apostrophe
@@ -443,17 +509,11 @@ class ElgivaExtractor(BaseExtractor):
                 if not addr_line:
                     continue
 
-                # Venue name: token(s) between the leading symbol and the 4-digit year
-                # e.g. "© The Elgiva 2026. All rights reserved."
-                for ln in lines:
-                    m = re.search(r"\S+\s+([\w\s]+?)\s+\d{4}", ln)
-                    if m:
-                        result["venue"] = m.group(1).strip()
-                        break
-
                 addr_parts = [p.strip() for p in addr_line.split(",")]
                 postcode = extract_postcode(addr_line, region="UK")
-                result["address"] = f"{addr_parts[0]}, {postcode}" if postcode else addr_parts[0]
+                result["address"] = (
+                    f"{addr_parts[0]}, {postcode}" if postcode else addr_parts[0]
+                )
                 result["city"] = addr_parts[1] if len(addr_parts) > 1 else None
                 if postcode:
                     _, country = get_city_country_uk(postcode)
@@ -461,19 +521,24 @@ class ElgivaExtractor(BaseExtractor):
                 return result
 
             # Strategy 2: contact page fallback
-            self.custom_logger.info("  Listing page footer parse failed — trying contact page")
+            self.custom_logger.info(
+                "  Listing page footer parse failed — trying contact page"
+            )
             driver.get(f"{BASE_URL}/contact/")
             for el in driver.find_elements(By.XPATH, "//p[contains(., 'HP5')]"):
                 raw = el.text.replace(" ", " ").replace("’", "'")
                 parts = [p.strip() for p in raw.strip().split(",")]
                 if len(parts) >= 3:
                     postcode = extract_postcode(raw, region="UK")
-                    result["venue"] = parts[0]
-                    result["address"] = f"{parts[1]}, {postcode}" if postcode else parts[1]
+                    result["address"] = (
+                        f"{parts[1]}, {postcode}" if postcode else parts[1]
+                    )
                     result["city"] = parts[2]
                     if postcode:
                         _, country = get_city_country_uk(postcode)
-                        result["country"] = normalize_country(country) if country else None
+                        result["country"] = (
+                            normalize_country(country) if country else None
+                        )
                     return result
 
         except Exception as e:
